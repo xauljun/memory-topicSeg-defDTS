@@ -10,12 +10,16 @@ import numpy as np
 import os
 from nltk.tokenize import sent_tokenize
 import anthropic
+from google import genai
 from sklearn.metrics import f1_score, cohen_kappa_score
+from dotenv import load_dotenv
 # from vllm import LLM, SamplingParams
+load_dotenv()
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ANTHROPIC = os.environ.get("ANTHROPIC_API_KEY", "")
 API_KEY = {
 }
-ANTHROPIC = ""
 GPT_VERSION = "gpt-4o-2024-05-13"
 
 def alternative_load_dataset(dataset_name, dataset_split):
@@ -29,26 +33,27 @@ def init_llm(model_name):
                 gpu_memory_utilization=0.9,
                 enforce_eager=True)
     tok = AutoTokenizer.from_pretrained(model_name)
-    
+
     return model, tok
 
 class SegAnnotator:
     def __init__(self, key_owner='', template='no_dst', model=GPT_VERSION, change_speaker=False):
         self.key_owner = key_owner
-        
-        self.gpt = OpenAI(api_key = API_KEY[self.key_owner])
+
+        self.gpt = OpenAI(api_key = API_KEY.get(self.key_owner, ''))
         self.sonnet = anthropic.Anthropic(api_key=ANTHROPIC)
+        self.gemini = genai.Client(api_key=GEMINI_API_KEY)
         self.old = template == 'no_dst'
         self.template_name = template
         self.template = ''
         if template != 'plain':
             with open(f'prompts/{template}.prompt', 'r', encoding='utf-8') as f:
                 self.template = f.read()
-        
-        
+
+
         self.result = {}
         self.verbose = False
-        if 'gpt' in model or 'claude' in model:
+        if 'gpt' in model or 'claude' in model or 'gemini' in model:
             self.model = model
         else:
             self.model, self.tok = init_llm(model)
@@ -61,7 +66,7 @@ class SegAnnotator:
             'out': 0
         }
         self.fewshot_list = []
-    
+
     def compute_cost(self, usage):
         cost = 0
         cost += usage.completion_tokens * 15 / 1000000
@@ -70,7 +75,7 @@ class SegAnnotator:
         self.acc_usage['in'] += usage.prompt_tokens
         self.acc_usage['out'] += usage.completion_tokens
         return cost
-    
+
     def create_prompt(self, data):
         dialogue = [line.split(': ')[-1].strip() for line in data.split('[NEWLINE]') if line.strip() != '[BOUNDARY]']
         # making prompt
@@ -83,25 +88,25 @@ class SegAnnotator:
             "\nOutput format: Part i: Ua-Ub\n",
             "\n=====\nOutput example:\nPart 1: U1-U4\nPart 2: U5-U6\n=====\n"
         ]
-        
+
         utterances = []
         for i, utterance in enumerate(dialogue):
             utterances.append(f"U{i+1}: {utterance}\n")
-            
+
         prompt = ''.join(prefix + utterances + suffix)
 
         return prompt
-        
+
     def fill_prompt(self, data):
         turn_inputs = []
         if self.template == '':
             return self.create_prompt(data)
-        
+
         if self.old:
             turn_template = "<T[turn_idx]>\n<User>[user]</User>\n<AI>[ai]</AI>\n</T[turn_idx]>"
-        
+
             dialogue = [line.split(': ')[-1].strip() for line in data.split('[NEWLINE]') if line.strip() != '[BOUNDARY]']
-        
+
             for idx in range(0, len(dialogue) - 1, 2):
                 user, ai = dialogue[idx], dialogue[idx + 1]
                 turn_idx = (int)(idx / 2)
@@ -110,31 +115,31 @@ class SegAnnotator:
             turn_template = "<U[uttr_idx]>\n<speaker>[speaker]</speaker>\n<utterance>[uttr]</utterance>\n</U[uttr_idx]>"
             if 'no_dst' in self.template_name:
                 turn_template = "<U[uttr_idx]>\n<[speaker]>[uttr]</[speaker]>\n</U[uttr_idx]>"
-            
+
             speakers = [line.split(': ')[0].strip() for line in data.split('[NEWLINE]') if line.strip() != '[BOUNDARY]']
             dialogues = [line.split(': ')[-1].strip() for line in data.split('[NEWLINE]') if line.strip() != '[BOUNDARY]']
-            
+
             for idx in range(len(speakers)):
                 turn_inputs.append(
                     turn_template.replace('[uttr_idx]', str(idx))\
                         .replace('[speaker]', self.speaker_map[speakers[idx]])\
                         .replace('[uttr]', dialogues[idx])
                 )
-            
+
         dialogue = '\n'.join(turn_inputs)
         prompt = self.template.replace("{XML-structured dialogue}", dialogue)
         if self.verbose: print(prompt)
         return prompt
-    
+
     def infer(self, prompt):
         messages = []
-        
+
         if self.template == '':
             messages += [{
                 'role': 'system',
                 'content': "You are a helpful assistance to segment give dialogues.\nPlease follow the output format.\nDO NOT explain."
             }]
-        
+
         messages += self.fewshot_list
         messages += [
             {
@@ -142,14 +147,14 @@ class SegAnnotator:
                 "content": prompt,
             }
         ]
-        
+
         chat_completion = self.gpt.chat.completions.create(
             messages=messages,
             temperature=0.0,
             model=self.model,
         )
         return chat_completion
-    
+
     def infer_sonnet(self, prompt):
         message = self.sonnet.messages.create(
             model="claude-3-5-sonnet-20240620",
@@ -163,7 +168,14 @@ class SegAnnotator:
         response_texts = [block.text for block in message.content if hasattr(block, 'text')]
         result_text = " ".join(response_texts)
         return result_text
-    
+
+    def infer_gemini(self, prompt):
+        response = self.gemini.models.generate_content(
+            model=self.model,
+            contents=prompt,
+        )
+        return response.text
+
     def infer_local(self, prompt, model, tok):
         from vllm import SamplingParams
         messages = []
@@ -176,7 +188,7 @@ class SegAnnotator:
                 'role': 'system',
                 'content': "You are a helpful assistance to segment give dialogues.\nPlease follow the output format.\nDO NOT explain."
             }]
-        
+
         messages += self.fewshot_list
         messages += [
             {
@@ -187,8 +199,8 @@ class SegAnnotator:
         chat = tok.apply_chat_template(messages, tokenize=False)
         response = model.generate(chat,
                                   sampling_params=sampling_params)
-        return response[0].outputs[0].text        
-        
+        return response[0].outputs[0].text
+
     def construct_fewshot_example(self, example_path, dialogue):
         example_prompt = self.fill_prompt(dialogue)
         with open(example_path, 'r') as f:
@@ -201,7 +213,7 @@ class SegAnnotator:
             "role": "assistant",
             "content": example_output
         }])
-    
+
     def load_data(self, dataset_name, dataset_split, ratio=1.0, start=0):
         self.domain = dataset_name
         self.speaker_map = {
@@ -213,57 +225,60 @@ class SegAnnotator:
                 'user' : 'speaker1',
                 'agent' : 'speaker2'
             }
-        
-            
+
+
         dataset = alternative_load_dataset(dataset_name, dataset_split)
-        
+
         ratio = max(0, ratio)
         n_samples = ratio if ratio >= 1 else int(len(dataset['dialogue']) * ratio)
-        
+
         end = min(len(dataset['dialogue']), start + n_samples)
-        
+
         print(f"DATASET RANGE: [{start}:{end}]")
-    
+
         dataset = dataset.select(range(start, end))
-        return dataset     
-    
+        return dataset
+
     def data_process(self, dataset_name, dataset_split, ratio=1.0, token_check_only=False, start=0):
         dataset = self.load_data(dataset_name, dataset_split, ratio, start)
         if token_check_only: return
         for data in tqdm(dataset):
             prompt = self.fill_prompt(data['dialogue'])
-            
-            if self.model == 'gpt-4o':
+
+            if 'gpt' in self.model:
                 result = self.infer(prompt)
                 self.result[data['id']] = result.choices[0].message.content
                 cost = self.compute_cost(result.usage)
-            elif self.model =='claude':
+            elif 'claude' in self.model:
                 result = self.infer_sonnet(prompt)
+                self.result[data['id']] = result
+            elif 'gemini' in self.model:
+                result = self.infer_gemini(prompt)
                 self.result[data['id']] = result
             else:
                 result = self.infer_local(prompt, model=self.model, tok=self.tok)
                 self.result[data['id']] = result.split('|>\n\n')[-1]
-                
-        if self.model == 'gpt-4o': 
+
+        if 'gpt' in self.model:
             with open('usage.json', 'r') as f:
                 usage = json.load(f)
-                
+
             try:
                 usage[self.key_owner] += self.acc_usage['$']
             except:
                 usage[self.key_owner] = self.acc_usage['$']
-            
+
             print('[current cost]')
             for k, v in self.acc_usage.items():
                 print(f'{k:<3}: {v}')
-                
+
             print('[acc cost]')
             for k, v in usage.items():
                 print(f'{k:<3}: {v}$')
-            
+
             with open('usage.json', 'w') as f:
                 json.dump(usage, f)
-                        
+
     def save_result_json(self, save_path='result_json.json'):
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(self.result, f, indent=4, ensure_ascii=False)
@@ -271,14 +286,14 @@ class SegAnnotator:
 def process(domain:str, template:str='fift', amount:str=30, start=0, save_path=None, key_owner='mh', change_speaker=False, fewshot_idxs = [], model='gpt-4o') -> None:
     if save_path is None:
         save_path=f'results/{template}_{domain}.json'
-    
+
     agent = SegAnnotator(
         key_owner=key_owner,
-        template=template, 
-        model=model, 
+        template=template,
+        model=model,
         change_speaker=change_speaker
     )
-    
+
     # Build Few-shot Examples
     if len(fewshot_idxs) != 0:
         fewshot_source = agent.load_data('tiage', 'train', 300, 0)
@@ -286,10 +301,10 @@ def process(domain:str, template:str='fift', amount:str=30, start=0, save_path=N
         for data in fewshot_source:
             if data['id'] not in data_ids: continue
             agent.construct_fewshot_example(f"few_shot_silo/{template}/{data['id']}.example", data['dialogue'])
-    
+
     # Processing..
     agent.data_process(domain, 'test', ratio=amount, token_check_only=False, start=start)
-    
+
     # Load Progress
     if os.path.exists(save_path):
         with open(save_path, 'r', encoding='utf-8') as f:
@@ -297,7 +312,7 @@ def process(domain:str, template:str='fift', amount:str=30, start=0, save_path=N
         for k, v in results.items():
             if k not in agent.result.keys():
                 agent.result[k] = v
-    
+
     agent.save_result_json(save_path=save_path)
     print(f"Saved on {save_path}")
 
@@ -316,22 +331,22 @@ def binarize_segment(seq: List[int]) -> List[int]:
 def compute_metrics(preds, labels) -> dict:
     wd_score = 0
     pk_score = 0
-    
+
     pred_binary = []
     label_binary = []
-    
+
     mismatched_count = 0
     for pred, label in zip(preds, labels):
         if sum(pred) != sum(label):
             mismatched_count += 1
             continue
-        
+
         wd = float(segeval.window_diff(pred, label))
         pk = float(segeval.pk(pred, label))
-        
+
         wd_score += wd
         pk_score += pk
-        
+
         pred_bin = binarize_segment(pred)
         label_bin = binarize_segment(label)
         if len(pred_bin) != len(label_bin):
@@ -341,17 +356,17 @@ def compute_metrics(preds, labels) -> dict:
             print(len(label_bin))
             print(label)
             print(label_bin)
-        
+
         pred_binary.extend(pred_bin)
         label_binary.extend(label_bin)
-        
+
     c = len(preds)
     c -= mismatched_count
-    
+
     wd_score /= c
     pk_score /= c
     f1 = f1_score(y_true=label_binary, y_pred=pred_binary, average='binary', zero_division=0)
-    
+
     if mismatched_count > 0:
         print("mismatched_count: ", mismatched_count)
     return {
@@ -372,7 +387,7 @@ def extract_label(dialogue: List[str], return_output: bool = False) -> List[int]
             boundary[-1]+=1
             output.append(toggle)
             toggle = False
-    
+
     if return_output: return (boundary, output)
     return boundary
 
@@ -383,7 +398,7 @@ def extract_pred(model_output: List[bool]) -> List[int]:
             boundary.append(1)
         else:
             boundary[-1] += 1
-        
+
     return boundary
 
 def parse_output(data_path):
@@ -407,7 +422,7 @@ def parse_output(data_path):
             'uttr' : [],
             'act' : []
         }
-            
+
         # parse
         vs = v.strip().split('\n')
         for line in vs:
@@ -415,16 +430,16 @@ def parse_output(data_path):
                 result[new_key]['uttr'].append('YES' in line.upper())
             if '<utterance_type' in line or '<dialogue_type' in line or '<intent_label' in line or '<utterance_pattern' in line or '<utterance_intent' in line:
                 result[new_key]['act'].append(line.split('>')[1].split('<')[0])
-                
+
     return result
 
 def get_data(domain, domain_split='test'):
     dataset = alternative_load_dataset(domain, domain_split)
-    
+
     newlined = []
     for data in dataset:
         newlined.append(data['dialogue'].split('[NEWLINE]'))
-        
+
     return newlined
 
 def parse_simple_output(path):
@@ -455,7 +470,7 @@ def parse_plain_output(domain, domain_split='test', specified_path=None):
         nk = int(k.split('_')[-1])
         ref = [line.split(': ')[-1].strip() for line in refs[nk] if line.strip() != '[BOUNDARY]']
         results = v.split('\n')
-        
+
         end_indices = []
         for line in results:
             try:
@@ -473,113 +488,113 @@ def parse_plain_output(domain, domain_split='test', specified_path=None):
     return preds
 
 def align_pred_label(pred, label):
-    
+
     # Delete empty segment
     if pred[0] == 0: pred = pred[1:]
-    
+
     # Extension for Turn-level prediction template
     if sum(pred) == sum(label) // 2:
         pred = [p * 2 for p in pred]
-    
+
     # Fix micro parsing error
     if sum(pred) == sum(label) + 1:
         pred[0]-=1
     if sum(pred) == sum(label) - 1:
         pred[-1]+=1
-        
+
     n_pred, n_label = [p for p in pred if p != 0], [l for l in label if l != 0]
     return n_pred, n_label
 
 def compute_plain_performance(
-                            domain, 
-                            domain_split='test', 
-                            length=-1, 
-                            start=0, 
+                            domain,
+                            domain_split='test',
+                            length=-1,
+                            start=0,
                             verbose=False,
-                            indices=[], 
+                            indices=[],
                             specified_path=None,
                             compute_metric=True):
     dataset = alternative_load_dataset(domain, domain_split)
     result = parse_plain_output(domain, domain_split, specified_path)
     indices = indices if len(indices) > 0 else list(range(start, start + length))
-    
+
     preds = []
     labels = []
-    
+
     for idx in indices:
         if idx not in result.keys(): continue
-        
+
         res = result[idx]
         pred = extract_pred(res)
         label_dialogue = dataset[idx]['dialogue'].split('[NEWLINE]')
         label, label_output = extract_label(label_dialogue, True)
-        
+
         pred, label = align_pred_label(pred, label)
-        
+
         if verbose: print(f"{idx:2d}: [p->l] {pred} -> {label}")
         if sum(pred) != sum(label):
             print(f"ERROR in {idx:4d}: {sum(pred)} != {sum(label)}")
-        
+
         preds.append(pred)
         labels.append(label)
-        
+
     if compute_metric:
         return compute_metrics(preds, labels)
     else:
         return (preds, labels)
 
-def compute_gpt_performance(domain, 
-                            domain_split='test', 
-                            template='deft', 
-                            length=-1, 
-                            start=0, 
-                            verbose=False, 
-                            specified_path=None, 
-                            simple=False, 
+def compute_gpt_performance(domain,
+                            domain_split='test',
+                            template='deft',
+                            length=-1,
+                            start=0,
+                            verbose=False,
+                            specified_path=None,
+                            simple=False,
                             indices=[],
                             specified_result=None,
                             compute_metric=True):
     dataset = alternative_load_dataset(domain, domain_split)
     path = specified_path if specified_path else f'results/{template}_{domain}.json'
-    
+
     if specified_result: result = specified_result
     else: result = parse_output(path) if not simple else parse_simple_output(path)
-    
+
     indices = indices if len(indices) > 0 else list(range(start, start + length))
-    
+
     report = defaultdict(list)
     detail_error = defaultdict(list)
-    
+
     preds = []
     labels = []
-    
+
     for idx in indices:
         if idx not in result.keys(): continue
-        
+
         res = result[idx]
         pred = extract_pred(res['uttr'])
         label_dialogue = dataset[idx]['dialogue'].split('[NEWLINE]')
         label, label_output = extract_label(label_dialogue, True)
-        
+
         pred, label = align_pred_label(pred, label)
-            
+
         for i, (p, l) in enumerate(zip(res['uttr'], label_output)):
             if i == 0: continue
             if len(res['act']) != 0:
                 report[res['act'][i]].append(f'{str(l)}-{str(p)}')
             reference = [line for line in label_dialogue if line != "[BOUNDARY]"][i]
-            
-            
+
+
             if p != l:
                 detail_err = f"{l:3d} | {reference}"
                 if len(res['act']) > 0: detail_err = detail_err.replace('|', f'| {res["act"][i]} |')
                 detail_error[idx].append(detail_err)
-        
+
         if verbose: print(f"{idx:2d}: [p->l] {pred} -> {label}")
         if sum(pred) != sum(label):
             print(f"ERROR in {idx:4d}: {sum(pred)} != {sum(label)}")
             # pred = [sum(label)]
-        
+
         preds.append(pred)
         labels.append(label)
 
@@ -591,32 +606,32 @@ def compute_gpt_performance(domain,
 def load_dialstart(domain:str, length=-1):
     dialstart_id = [x['label'] for x in load_json(f'dialstart_reproduce/{domain}.json')]
     dialstart_pred = [x['pred'] for x in load_json(f'dialstart_reproduce/{domain}.json')]
-    
+
     if length != -1:
         dialstart_id = dialstart_id[:length]
         dialstart_pred = dialstart_pred[:length]
-        
+
     return dialstart_pred, dialstart_id
 
 def compute_kappa(domain, template, length=50, start=0):
     dataset = alternative_load_dataset(domain, 'test')
     result = parse_output(f'results/{template}_{domain}.json')
-    
+
     model_selection = []
     dataset_selection = []
-    
+
     for idx in range(start, start + length):
         if idx not in result.keys(): continue
-        
+
         pred = [1 if select else 0 for select in result[idx]['uttr']]
         _, label_output = extract_label(dataset[idx]['dialogue'].split('[NEWLINE]'), True)
         label = [1 if select else 0 for select in label_output]
-        
+
         while(len(pred) != len(label)): pred.append(0)
-        
+
         model_selection.extend(pred)
         dataset_selection.extend(label)
-        
+
     return cohen_kappa_score(model_selection, dataset_selection)
 
 def pretty_print(d:dict, precision:int=6):
@@ -654,7 +669,7 @@ def parse_report(report):
             if l == 'False' and p == 'False':
                 new_report[k]['tn'] += 1
                 new_report['all']['tn'] += 1
-                
+
     return new_report
 
 def get_label_sentlen_analysis(detail_error):
@@ -668,7 +683,7 @@ def get_label_sentlen_analysis(detail_error):
                 counter[label][cnt] += 1
             except:
                 pass
-        
+
     return counter
 
 def agg_result(domain='tiage', template='deft_test', domain_split='test', length=30, start=0, verbose=False, specified_path=None):
